@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "felis-discord-bot"
+version = "0.1.0"
+description = ""
+authors = ["Hansaem Woo <me@felis.kr>"]
+license = "MIT License"
+readme = "README.md"
+packages = [{ include = "bot", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+"discord.py" = "^2.2.2"
+lagom = {extras = ["env"], version = "^2.4.1"}
+expression = "^4.2.4"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.3.0"
+Flake8-pyproject = "^1.2.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.isort]
+profile = "black"
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203"]
