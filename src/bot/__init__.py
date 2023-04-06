@@ -1,13 +1,18 @@
 import asyncio
 import logging
-from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol
 
 from discord import Client, Intents, Message, MessageType
 from discord.utils import MISSING
 from expression.collections import Block
 from lagom import Container, Singleton
 from lagom.environment import Env
+from returns.context import ReaderFutureResult, ReaderIOResult
+from returns.converters import maybe_to_result
+from returns.future import Future, FutureResult
+from returns.io import IO, IOResult, IOSuccess
+from returns.maybe import Maybe, Nothing, Some
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -16,41 +21,105 @@ class MyDiscordClientEnvironment(Env):
     discord_token: str
 
 
-class MessageHandler(ABC):
-    """메시지 이벤트 핸들러의 abstract class입니다."""
+class _DbConnection(Protocol):
+    session: str
 
+
+@dataclass(frozen=True)
+class Deletion:
+    server_id: int
+    template_message: str | None
+
+
+_repo: list[Deletion] = [
+    Deletion(
+        server_id=669234451263389696,
+        template_message="저희 서버에서 답장 기능은 금지되어 있어요! <#687619273849438228> 정독 부탁드려요!",
+    ),
+    Deletion(server_id=910708305247211520, template_message="야호"),
+]
+
+
+class DeletionRepo:
     @staticmethod
-    @abstractmethod
-    async def handle(message: Message) -> None:
-        raise NotImplementedError()
+    def get_all() -> ReaderIOResult[list[Deletion], None, _DbConnection]:
+        def func(conn: _DbConnection) -> IOResult[list[Deletion], None]:
+            logger.debug(conn)
+            return IOSuccess.from_value(_repo)
+
+        return ReaderIOResult(func)
 
 
-class ReplyDeletion(MessageHandler):
-    """메시지 이벤트를 이용하여 답장을 삭제하는 메시지 핸들러입니다."""
-
-    @staticmethod
-    async def handle(message: Message) -> None:
-        """전달된 메시지가 답장 기능을 사용하였을 경우 삭제한 후 경고 메시지를
-        전송합니다.
-
-        Args:
-            message (Message): 주입받은 메시지 객체
-        """
-        match message.type:
-            case MessageType.reply:
-                logger.info(
-                    f"{message.author.name}@{message.channel.name}: {message.content}"
-                )
-                await message.delete()
-                await message.channel.send(
-                    "저희 서버에서 답장 기능은 금지되어 있어요! <#687619273849438228> 정독 부탁드려요!"
-                )
-            case _:
-                pass
+_MessageHandler = Callable[[Message], ReaderFutureResult[None, Any, _DbConnection]]
 
 
-class MessageHandlerList(Block[MessageHandler]):
-    """메시지 핸들러를 모아둔 immutable collection입니다."""
+def delete_reply(
+    message: Message,
+) -> ReaderFutureResult[None, None, _DbConnection]:
+    """전달된 메시지가 답장 기능을 사용하였을 경우 삭제한 후 경고 메시지를
+    전송합니다.
+
+    Args:
+        message (Message): 주입받은 메시지 객체
+    """
+
+    def func(dep: _DbConnection) -> FutureResult[None, None]:
+        deletions: IO[list[Deletion]] = DeletionRepo.get_all()(dep).value_or([])
+        m: Maybe[Message] = _validate_if_message_type_is_reply(message).bind(
+            _validate_if_message_is_from_deletions(deletions)
+        )
+        return FutureResult.from_result(maybe_to_result(m)).bind_awaitable(
+            _delete_message_and_send_alert(deletions)
+        )
+
+    return ReaderFutureResult(func)
+
+
+def _validate_if_message_type_is_reply(message: Message) -> Maybe[Message]:
+    match message.type:
+        case MessageType.reply:
+            logger.info(
+                f"{message.author.name}@{message.channel.name}: {message.content}"
+            )
+            return Some(message)
+        case _:
+            return Nothing
+
+
+def _validate_if_message_is_from_deletions(deletions: IO[list[Deletion]]):
+    def func(message: Message) -> Maybe[Message]:
+        result: IO[Deletion | None] = deletions.map(
+            lambda c: filter(lambda x: x.server_id == message.guild.id, c)
+        ).map(lambda filtered_deletions: next(filtered_deletions, None))
+        if result:
+            return Some(message)
+        else:
+            return Nothing
+
+    return func
+
+
+def _delete_message_and_send_alert(deletions: IO[list[Deletion]]):
+    async def func(message: Maybe[Message]):
+        deletion: IO[Deletion] = deletions.map(
+            lambda l: filter(lambda x: x.server_id == message.guild.id, l)
+        ).map(lambda l: next(l))
+        await message.delete()
+        return await (
+            Future.from_io(deletion)
+            .bind_awaitable(lambda x: message.channel.send(x.template_message))
+            .awaitable()
+        )
+
+    return func
+
+
+MessageHandlerList = Block[_MessageHandler]
+
+
+@dataclass(frozen=True)
+class Test:
+    session: str
 
 
 class MyDiscordClient(Client):
@@ -99,7 +168,10 @@ class MyDiscordClient(Client):
             message (Message): 주입받은 메시지 객체
         """
         await asyncio.gather(
-            *(x.handle(message=message) for x in self._message_handler_list)
+            *(
+                handler(message=message)(Test(session="test")).awaitable()
+                for handler in self._message_handler_list
+            )
         )
 
 
@@ -107,6 +179,6 @@ def bootstrap() -> Container:
     container = Container()
     container[Intents] = Intents.default() | Intents(message_content=True)
     container[MyDiscordClientEnvironment] = Singleton(MyDiscordClientEnvironment)
-    container[MessageHandlerList] = MessageHandlerList.empty().cons(ReplyDeletion())
+    container[MessageHandlerList] = Block.empty().cons(delete_reply)
     container[MyDiscordClient] = Singleton(MyDiscordClient)
     return container
